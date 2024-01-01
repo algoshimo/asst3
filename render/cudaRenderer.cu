@@ -394,8 +394,8 @@ __global__ void kernelRenderCircles() {
     int index3 = 3 * index;
 
     // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);  //圆心
+    float  rad = cuConstRendererParams.radius[index];               //半径
 
     // compute the bounding box of the circle. The bound is in integer
     // screen coordinates, so it's clamped to the edges of the screen.
@@ -428,6 +428,77 @@ __global__ void kernelRenderCircles() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
+
+//origin solution issue : 
+//1. 每个线程依旧需要处理多个元素
+//2. 并不是每个元素都需要渲染
+
+__global__ void kernelRenderPixels() {
+    uint idx = blockDim.x * threadIdx.y + threadIdx.x;
+    uint pixelX = blockDim.x * blockIdx.x + threadIdx.x;
+    uint pixelY = blockDim.y * blockIdx.y + threadIdx.y;
+    short imageWidth = (short)cuConstRendererParams.imageWidth;
+    short imageHeight = (short)cuConstRendererParams.imageHeight;
+
+    float invWidth = 1.f / (float)imageWidth;
+    float invHeight = 1.f / (float)imageHeight;
+
+    // 线程块负责的矩形区域
+    uint boxL = blockDim.x * blockIdx.x;
+    uint boxR = boxL + blockDim.x < imageWidth ? boxL + blockDim.x : imageWidth;
+    uint boxB = blockDim.y * blockIdx.y;
+    uint boxT = boxB + blockDim.y < imageHeight ? boxB + blockDim.y : imageHeight;
+
+    float boxLNorm = (float)boxL * invWidth;
+    float boxRNorm = (float)boxR * invWidth;
+    float boxBNorm = (float)boxB * invHeight;
+    float boxTNorm = (float)boxT * invHeight;
+
+    __shared__ uint flag[BLOCKSIZE];
+    __shared__ uint presum[BLOCKSIZE];
+    __shared__ uint scratch[BLOCKSIZE * 2];
+    __shared__ uint circles[BLOCKSIZE];
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+    int numCircles = cuConstRendererParams.numCircles;
+    for (int i = 0; i < numCircles; i += BLOCKSIZE) {
+        uint circleIdx = i + idx;
+        // 本线程负责检查的圆的序号
+        // 检查圆是否与该区域有交叉
+        if (circleIdx < numCircles) {
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+            flag[idx] = circleInBox(p.x, p.y,
+                cuConstRendererParams.radius[circleIdx],
+                boxLNorm, boxRNorm, boxTNorm, boxBNorm);
+        } else {
+            flag[idx] = 0;
+        }
+        __syncthreads();
+
+        // 计算flag的前缀和
+        sharedMemExclusiveScan((int)idx, flag, presum, scratch, BLOCKSIZE);
+        __syncthreads();
+
+        // 获取所有可能和区域相交的圆
+        if (flag[idx])
+            circles[presum[idx]] = circleIdx;
+        __syncthreads();
+
+        // 进行渲染
+        if (pixelX < imageWidth && pixelY < imageHeight) {
+            uint num = presum[BLOCKSIZE - 1] + flag[BLOCKSIZE - 1]; // 可能和区域相交的圆的数量
+            for (int j = 0; j < num; ++j) {
+                float3 p = *(float3*)(&cuConstRendererParams.position[3 * circles[j]]);
+                shadePixel((int)circles[j], pixelCenterNorm, p, imgPtr);
+            }
+        }
+    }
+}
+
+
 
 
 CudaRenderer::CudaRenderer() {
@@ -637,9 +708,10 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(BLOCKDIM, BLOCKDIM);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    kernelRenderPixels<<<gridDim, blockDim>>>();
 }
